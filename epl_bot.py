@@ -1,10 +1,10 @@
 """
-بات تحلیل بازی‌های لیگ برتر انگلیس (سروش پلاس + VictoryAPI)
+بات تحلیل بازی‌های لیگ برتر انگلیس (سروش پلاس + football-data.org)
 
 اجرا:
     pip install requests
     export BOT_TOKEN="توکن بات سروش پلاس"
-    export VICTORY_API_KEY="کلید VictoryAPI"
+    export FOOTBALL_DATA_KEY="توکن football-data.org"
     python epl_bot.py
 
 همه‌چیز با دکمه‌های شیشه‌ای است؛ تنها دستور اسلشی /start است.
@@ -28,11 +28,11 @@ import requests
 
 # ------------------------- تنظیمات -------------------------
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
-VICTORY_KEY = os.environ.get("VICTORY_API_KEY", "")
+FD_KEY = os.environ.get("FOOTBALL_DATA_KEY", "")
 SPLUS_BASE = os.environ.get("SPLUS_API_BASE", "https://api.splus.ir/bot{token}")
-VICTORY_BASE = "https://api.v1.victoryapi.ir"
-LEAGUE_ID = 39  # لیگ برتر انگلیس
-STANDINGS_TTL = 6 * 3600
+FD_BASE = "https://api.football-data.org/v4"
+COMP = "PL"  # لیگ برتر انگلیس
+MATCHES_TTL = 30 * 60  # محدودیت پلن رایگان: ۱۰ درخواست در دقیقه
 H2H_TTL = 24 * 3600
 STICKER_TTL = 12 * 3600
 ADMIN_ID = os.environ.get("ADMIN_ID", "").strip()
@@ -79,41 +79,88 @@ def cached(key, ttl, fn):
     return val
 
 
-def victory_get(path: str, params: dict) -> dict:
-    r = requests.get(f"{VICTORY_BASE}/{path}", params=params,
-                     headers={"x-vapi-key": VICTORY_KEY}, timeout=20)
-    if r.status_code == 204:
-        return {"response": []}
+def fd_get(path: str, params: dict = None) -> dict:
+    r = requests.get(f"{FD_BASE}/{path}", params=params,
+                     headers={"X-Auth-Token": FD_KEY}, timeout=20)
     r.raise_for_status()
-    data = r.json()
-    if data.get("errors"):
-        raise RuntimeError(f"VictoryAPI: {data['errors']}")
-    return data
+    return r.json()
 
 
 # ------------------------- دریافت داده -------------------------
-def fetch_standings(season: int) -> list:
-    rows, page = [], 1
-    while True:
-        d = victory_get("Standings", {"leagueId": LEAGUE_ID, "season": season,
-                                      "pageNumber": page, "pageSize": 50})
-        for lg in d.get("response", []):
-            for group in lg["league"]["standings"]:
-                rows.extend(group)
-        total = (d.get("paging") or {}).get("total", 1)
-        if page >= total:
-            break
-        page += 1
+USED = {"season": None}
+
+
+def fetch_matches(season=None) -> list:
+    def load():
+        params = {"season": season} if season else None
+        return fd_get(f"competitions/{COMP}/matches", params).get("matches", [])
+    return cached(f"matches:{season}", MATCHES_TTL, load)
+
+
+def clean_name(n: str) -> str:
+    n = re.sub(r"^AFC\s+|\s+(AFC|FC)$", "", n.strip())
+    return n
+
+
+def is_done(m: dict) -> bool:
+    ft = (m.get("score") or {}).get("fullTime") or {}
+    return m.get("status") == "FINISHED" and ft.get("home") is not None and ft.get("away") is not None
+
+
+def build_rows(matches: list) -> list:
+    """از لیست بازی‌ها جدول لیگ را (با آمار خانه/بیرون و فرم) می‌سازد."""
+    def blank():
+        return {"played": 0, "win": 0, "draw": 0, "lose": 0, "goals": {"for": 0, "against": 0}}
+    teams = {}
+    for m in matches:
+        for side in ("homeTeam", "awayTeam"):
+            t = m.get(side) or {}
+            if t.get("id") is not None and t["id"] not in teams:
+                teams[t["id"]] = {"team": {"id": t["id"], "name": clean_name(t.get("name") or str(t["id"])),
+                                           "short": t.get("shortName") or t.get("tla") or ""},
+                                  "home": blank(), "away": blank(), "results": []}
+    done = sorted((m for m in matches if is_done(m)), key=lambda m: m.get("utcDate") or "")
+    for m in done:
+        gh, ga = m["score"]["fullTime"]["home"], m["score"]["fullTime"]["away"]
+        for side, mine, theirs in (("home", gh, ga), ("away", ga, gh)):
+            row = teams.get(m[side + "Team"]["id"])
+            if not row:
+                continue
+            st = row[side]
+            st["played"] += 1
+            st["goals"]["for"] += mine
+            st["goals"]["against"] += theirs
+            res = "W" if mine > theirs else "D" if mine == theirs else "L"
+            st[{"W": "win", "D": "draw", "L": "lose"}[res]] += 1
+            row["results"].append(res)
+    rows = []
+    for row in teams.values():
+        h, a = row["home"], row["away"]
+        row["points"] = 3 * (h["win"] + a["win"]) + h["draw"] + a["draw"]
+        row["goalsDiff"] = (h["goals"]["for"] + a["goals"]["for"]) - (h["goals"]["against"] + a["goals"]["against"])
+        row["gf"] = h["goals"]["for"] + a["goals"]["for"]
+        row["form"] = "".join(row.pop("results"))[-5:]
+        rows.append(row)
+    rows.sort(key=lambda r: (-r["points"], -r["goalsDiff"], -r["gf"], r["team"]["name"]))
+    for i, r in enumerate(rows, 1):
+        r["rank"] = i
     return rows
 
 
 def get_table() -> list:
-    season = current_season()
+    forced = os.environ.get("SEASON", "").strip()  # اختیاری: مثلاً 2026
+    matches = fetch_matches(int(forced) if forced.isdigit() else None)
+    if matches:
+        start = ((matches[0].get("season") or {}).get("startDate") or "")[:4]
+        USED["season"] = int(start) if start.isdigit() else current_season()
+    if not any(is_done(m) for m in matches):
+        return []  # هنوز بازی‌ای انجام نشده
+    return build_rows(matches)
 
-    def load():
-        rows = fetch_standings(season)
-        return rows or fetch_standings(season - 1)  # اگر فصل جدید هنوز خالی بود
-    return cached("standings", STANDINGS_TTL, load)
+
+def season_label() -> str:
+    s = USED["season"]
+    return f"{s}-{str(s + 1)[2:]}" if s else ""
 
 
 def find_team(text: str, table: list):
@@ -130,14 +177,26 @@ def find_team(text: str, table: list):
 
 
 def fetch_h2h(home_id: int, away_id: int) -> list:
+    """بازی‌های رودررو در فصل جاری (و فصل قبل، اگر پلن اجازه بدهد)."""
     def load():
-        d = victory_get("fixtures/headtohead", {"teamHomeId": home_id, "teamAwayId": away_id})
-        done = [f for f in d.get("response", [])
-                if f["fixture"]["status"]["short"] in ("FT", "AET", "PEN")
-                and f["goals"]["home"] is not None]
-        done.sort(key=lambda f: f["fixture"]["timestamp"], reverse=True)
-        return done[:5]
-    return cached(f"h2h:{home_id}:{away_id}", H2H_TTL, load)
+        pool = [m for m in fetch_matches(int(os.environ["SEASON"]) if os.environ.get("SEASON", "").isdigit() else None)]
+        if USED["season"]:
+            try:
+                pool += fetch_matches(USED["season"] - 1)
+            except Exception as e:  # noqa  (پلن رایگان فصل‌های قبل را نمی‌دهد)
+                print("Previous season unavailable:", repr(e))
+        out = []
+        for m in pool:
+            ids = {(m.get("homeTeam") or {}).get("id"), (m.get("awayTeam") or {}).get("id")}
+            if ids == {home_id, away_id} and is_done(m):
+                ft = m["score"]["fullTime"]
+                out.append({"goals": {"home": ft["home"], "away": ft["away"]},
+                            "teams": {"home": {"id": m["homeTeam"]["id"], "name": clean_name(m["homeTeam"].get("name", ""))},
+                                      "away": {"id": m["awayTeam"]["id"], "name": clean_name(m["awayTeam"].get("name", ""))}},
+                            "date": m.get("utcDate") or ""})
+        out.sort(key=lambda f: f["date"], reverse=True)
+        return out[:5]
+    return cached(f"h2h:{home_id}:{away_id}", MATCHES_TTL, load)
 
 
 # ------------------------- مدل پیش‌بینی -------------------------
@@ -342,10 +401,10 @@ def view_table(table):
         if gd is None:
             gd = (h["goals"]["for"] + a["goals"]["for"]) - (h["goals"]["against"] + a["goals"]["against"])
         pts = r.get("points", w * 3 + d)
-        name = r["team"]["name"][:13]
+        name = (r["team"].get("short") or r["team"]["name"])[:13]
         rows.append(f"{r.get('rank', ''):>2} {name:<13} {played:>2} {w:>2} {d:>2} {l:>2} {gd:>3} {pts:>3}")
     head = " # Team           P  W  D  L  GD Pts"
-    text = f"📊 <b>جدول لیگ برتر انگلیس</b>\n{LINE}\n\n<pre>{esc(head)}\n" + esc("\n".join(rows)) + "</pre>"
+    text = f"📊 <b>جدول لیگ برتر انگلیس</b>  <i>(فصل {season_label()})</i>\n{LINE}\n\n<pre>{esc(head)}\n" + esc("\n".join(rows)) + "</pre>"
     return text, kb([[btn("🔄 بروزرسانی", "tab"), btn("⚽ تحلیل بازی", "an")], BACK_MENU])
 
 
@@ -446,6 +505,7 @@ def build_reply(home: dict, away: dict, table: list) -> str:
         f"🔥 بیش از ۲.۵ گل: <b>{p['over25'] * 100:.0f}%</b>",
         f"🥅 هر دو تیم گل می‌زنند: <b>{p['btts'] * 100:.0f}%</b>",
         "", LINE,
+        f"📅 <i>آمار فصل {season_label()}</i>",
         "⚠️ <i>پیش‌بینی آماری است و تضمینی نیست؛ برای شرط‌بندی استفاده نکنید.</i>",
     ]
     return "\n".join(lines), p
@@ -498,7 +558,12 @@ def show(chat: int, mid: int, view):
 
 def api_error_text(e: Exception) -> str:
     if isinstance(e, requests.HTTPError):
-        return f"خطا در دریافت اطلاعات از API ({e.response.status_code}). کمی بعد دوباره امتحان کن."
+        code = e.response.status_code
+        if code == 429:
+            return "درخواست‌ها زیاد بود (محدودیت ۱۰ در دقیقه). یه دقیقه صبر کن و دوباره امتحان کن."
+        if code in (401, 403):
+            return "کلید API نامعتبره یا به لیگ برتر دسترسی نداره."
+        return f"خطا در دریافت اطلاعات از API ({code}). کمی بعد دوباره امتحان کن."
     print("ERROR:", repr(e))
     return "مشکلی پیش آمد. دوباره امتحان کن."
 
@@ -616,8 +681,8 @@ def on_message(msg: dict):
 
 
 def main():
-    if not BOT_TOKEN or not VICTORY_KEY:
-        raise SystemExit("BOT_TOKEN و VICTORY_API_KEY را در متغیرهای محیطی بگذارید.")
+    if not BOT_TOKEN or not FD_KEY:
+        raise SystemExit("BOT_TOKEN و FOOTBALL_DATA_KEY را در متغیرهای محیطی بگذارید.")
     try:  # فقط /start در منوی دستورات بماند
         splus("setMyCommands", commands=[{"command": "start", "description": "شروع بات 🚀"}])
     except Exception as e:  # noqa
